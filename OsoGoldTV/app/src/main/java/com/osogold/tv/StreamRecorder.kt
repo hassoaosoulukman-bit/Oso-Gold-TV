@@ -1,14 +1,11 @@
 package com.osogold.tv
 
-import android.content.ContentValues
 import android.content.Context
-import android.media.MediaScannerConnection
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
+import android.os.StatFs
 import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -17,8 +14,8 @@ import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
+import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.net.HttpURLConnection
@@ -28,17 +25,17 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Records the live stream that is currently playing and saves it as an MP4 file in the phone's
- * Downloads folder (Downloads/OsoGoldTV).
+ * Records ANY stream that is playing: live TV, radio, movies and series.
  *
- * How it works
- *  1. The stream is downloaded (HLS playlists segment by segment, other streams byte by byte)
- *     into a temporary file.
- *  2. When the recording is stopped the temporary file is converted ("transmuxed") to MP4 with
- *     Media3 Transformer and copied to Downloads.
- *  3. If the conversion is impossible for a stream, the raw recording is saved instead
- *     (extension .ts) so nothing is lost.
+ *  - HLS (m3u8)      : playlist polled, every new segment appended (survives short network cuts)
+ *  - live TS / radio : bytes copied; the connection is re-opened automatically after a drop, so a
+ *                      recording of many hours (3 hours and more) keeps going
+ *  - movies / series : the file is copied as it is (mp4, mkv ...)
  *
+ * The file is written directly into Download/OsoGoldTV while recording. A live .ts recording up
+ * to [CONVERT_LIMIT_BYTES] is converted to MP4 when it is stopped; longer ones stay .ts (plays
+ * everywhere, and no long conversion is needed).
+ * Recording stops by itself when the free space of the phone falls under 150 MB.
  * Not supported: DRM / AES-encrypted HLS streams.
  */
 class StreamRecorder(private val context: Context) {
@@ -52,12 +49,19 @@ class StreamRecorder(private val context: Context) {
     @Volatile
     private var connection: HttpURLConnection? = null
 
+    @Volatile
+    var lowSpace = false
+        private set
+
     private var worker: Thread? = null
-    private var tempFile: File? = null
+    private var handle: RecordingStore.Handle? = null
+    private var stream: OutputStream? = null
     private var title = "stream"
+    private var extension = "ts"
+    private var live = true
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** Called on the main thread when the download ended by itself (network error / end of stream). */
+    /** Called on the main thread when the download ended by itself (network error / disk full). */
     var onWorkerEnded: (() -> Unit)? = null
 
     val isRecording: Boolean
@@ -70,17 +74,22 @@ class StreamRecorder(private val context: Context) {
 
     fun start(url: String, name: String): Boolean {
         if (running || busy) return false
-        val dir = File(context.cacheDir, "rec")
-        dir.mkdirs()
-        dir.listFiles()?.forEach { it.delete() } // remove leftovers of older recordings
-        val file = File(dir, "rec_${System.currentTimeMillis()}.ts")
-        tempFile = file
         title = name
+        val kind = kindOf(url)
+        extension = kind.first
+        live = kind.second
+        val fileName = "OsoGoldTV_" + sanitize(name) + "_" +
+            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + "." + extension
+        val created = RecordingStore.create(context, fileName, mimeOf(extension)) ?: return false
+        handle = created.first
+        val out = BufferedOutputStream(created.second, 256 * 1024)
+        stream = out
+        lowSpace = false
         running = true
 
         worker = Thread({
             try {
-                if (isHls(url)) recordHls(url, file) else recordProgressive(url, file)
+                if (isHls(url)) recordHls(url, out) else recordProgressive(url, out)
             } catch (e: Exception) {
                 Log.w(TAG, "Recording download ended: ${e.message}")
             } finally {
@@ -103,53 +112,86 @@ class StreamRecorder(private val context: Context) {
         running = false
         busy = true
 
-        val source = tempFile
-        val name = title
+        val h = handle
+        val out = stream
         Thread({
-            // closing the socket must not happen on the main thread
             try {
-                connection?.disconnect()
+                connection?.disconnect() // must not happen on the main thread
             } catch (_: Exception) {
             }
             try {
-                worker?.join(8_000L)
+                worker?.join(10_000L)
             } catch (_: InterruptedException) {
             }
+            try {
+                out?.flush()
+                out?.close()
+            } catch (_: Exception) {
+            }
             mainHandler.post {
-                if (source == null || !source.exists() || source.length() < 4_096L) {
-                    source?.delete()
+                if (h == null) {
                     busy = false
                     onDone(null)
                 } else {
-                    convertAndSave(source, name, onDone)
+                    val size = RecordingStore.sizeOf(context, h)
+                    if (size < 4_096L) {
+                        RecordingStore.discard(context, h)
+                        busy = false
+                        onDone(null)
+                    } else {
+                        val path = RecordingStore.finish(context, h)
+                        if (extension == "ts" && size <= CONVERT_LIMIT_BYTES) {
+                            convertToMp4(h, path, onDone)
+                        } else {
+                            busy = false
+                            onDone(path)
+                        }
+                    }
                 }
             }
         }, "OsoGoldRecorderStop").start()
     }
 
-    private fun convertAndSave(source: File, name: String, onDone: (String?) -> Unit) {
-        val baseName = "OsoGoldTV_" + sanitize(name) + "_" +
-            SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val output = File(source.parentFile, "$baseName.mp4")
+    /** .ts -> .mp4 (short recordings). If anything fails the .ts file simply stays. */
+    private fun convertToMp4(source: RecordingStore.Handle, tsPath: String, onDone: (String?) -> Unit) {
+        val temp = File(context.cacheDir, "convert_${System.currentTimeMillis()}.mp4")
+        val input: Uri = source.uri ?: Uri.fromFile(source.file!!)
 
-        fun saveRawFallback() {
-            val path = saveToDownloads(source, "$baseName.ts", "video/mp2t")
-            source.delete()
-            output.delete()
+        fun keepTs() {
+            temp.delete()
             busy = false
-            onDone(path)
+            onDone(tsPath)
         }
 
         try {
             val transformer = Transformer.Builder(context)
-                .setAudioMimeType(MimeTypes.AUDIO_AAC) // transcode audio only when it is not AAC yet
+                .setAudioMimeType(MimeTypes.AUDIO_AAC)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        val path = saveToDownloads(output, "$baseName.mp4", "video/mp4")
-                        source.delete()
-                        output.delete()
-                        busy = false
-                        onDone(path)
+                        Thread({
+                            val mp4Name = source.name.removeSuffix(".ts") + ".mp4"
+                            val created = RecordingStore.create(context, mp4Name, "video/mp4")
+                            var ok = false
+                            if (created != null) {
+                                try {
+                                    created.second.use { o -> temp.inputStream().use { it.copyTo(o) } }
+                                    ok = true
+                                } catch (_: Exception) {
+                                }
+                            }
+                            mainHandler.post {
+                                if (ok && created != null) {
+                                    val mp4Path = RecordingStore.finish(context, created.first)
+                                    RecordingStore.discard(context, source) // the .ts is no longer needed
+                                    temp.delete()
+                                    busy = false
+                                    onDone(mp4Path)
+                                } else {
+                                    created?.let { RecordingStore.discard(context, it.first) }
+                                    keepTs()
+                                }
+                            }
+                        }, "OsoGoldMp4Save").start()
                     }
 
                     override fun onError(
@@ -157,17 +199,15 @@ class StreamRecorder(private val context: Context) {
                         exportResult: ExportResult,
                         exportException: ExportException
                     ) {
-                        Log.w(TAG, "MP4 conversion failed, saving raw recording", exportException)
-                        saveRawFallback()
+                        Log.w(TAG, "MP4 conversion failed, keeping .ts", exportException)
+                        keepTs()
                     }
                 })
                 .build()
-
-            val item = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(source))).build()
-            transformer.start(item, output.absolutePath)
+            transformer.start(EditedMediaItem.Builder(MediaItem.fromUri(input)).build(), temp.absolutePath)
         } catch (e: Exception) {
             Log.w(TAG, "Could not start conversion", e)
-            saveRawFallback()
+            keepTs()
         }
     }
 
@@ -175,29 +215,64 @@ class StreamRecorder(private val context: Context) {
 
     private fun isHls(url: String): Boolean = url.contains(".m3u8", ignoreCase = true)
 
-    /** Plain streams (TS, MP4, MKV, MP3, AAC ...): copy bytes until stopped. */
-    private fun recordProgressive(url: String, out: File) {
-        val conn = open(url)
-        connection = conn
-        try {
-            conn.inputStream.use { input ->
-                FileOutputStream(out).use { fos ->
-                    val buffer = ByteArray(64 * 1024)
-                    while (running) {
-                        val n = input.read(buffer)
-                        if (n < 0) break
-                        fos.write(buffer, 0, n)
-                    }
-                }
+    /** Checks the free space every 32 MB. Returns false (and stops) when the phone is nearly full. */
+    private fun spaceOk(written: Long): Boolean {
+        return try {
+            val free = StatFs(Environment.getExternalStorageDirectory().path).availableBytes
+            if (free < MIN_FREE_BYTES) {
+                lowSpace = true
+                running = false
+                false
+            } else {
+                true
             }
-        } finally {
-            conn.disconnect()
-            connection = null
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    /** Plain streams: copy bytes until stopped; live streams reconnect after a drop. */
+    private fun recordProgressive(url: String, out: OutputStream) {
+        var written = 0L
+        var nextCheck = CHECK_EVERY_BYTES
+        var failures = 0
+        while (running) {
+            var gotBytes = false
+            try {
+                val conn = open(url)
+                connection = conn
+                try {
+                    conn.inputStream.use { input ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (running) {
+                            val n = input.read(buffer)
+                            if (n < 0) break
+                            out.write(buffer, 0, n)
+                            gotBytes = true
+                            written += n
+                            if (written >= nextCheck) {
+                                nextCheck += CHECK_EVERY_BYTES
+                                if (!spaceOk(written)) return
+                            }
+                        }
+                    }
+                } finally {
+                    conn.disconnect()
+                    connection = null
+                }
+            } catch (e: IOException) {
+                if (!live) throw e
+            }
+            if (!live) return // a movie / episode ends when the file ends
+            if (!running) return
+            failures = if (gotBytes) 0 else failures + 1
+            if (failures > 90) throw IOException("انقطع البث لفترة طويلة")
+            sleepWhileRunning(2_000L)
         }
     }
 
     /** HLS: poll the playlist and append every new segment. */
-    private fun recordHls(url: String, out: File) {
+    private fun recordHls(url: String, out: OutputStream) {
         var playlistUrl = url
         var text = httpText(playlistUrl)
 
@@ -211,52 +286,77 @@ class StreamRecorder(private val context: Context) {
             text = httpText(playlistUrl)
         }
 
-        FileOutputStream(out).use { fos ->
-            val seen = HashSet<String>()
-            var initWritten = false
-            while (running) {
-                var targetSeconds = 6.0
-                var endList = false
-                val segments = ArrayList<String>()
-                var mapUri: String? = null
+        val seen = LinkedHashSet<String>()
+        var initWritten = false
+        var written = 0L
+        var nextCheck = CHECK_EVERY_BYTES
+        var failures = 0
+        while (running) {
+            var targetSeconds = 6.0
+            var endList = false
+            val segments = ArrayList<String>()
+            var mapUri: String? = null
 
-                for (raw in text.lines()) {
-                    val line = raw.trim()
-                    when {
-                        line.startsWith("#EXT-X-TARGETDURATION:") ->
-                            targetSeconds = line.substringAfter(':').toDoubleOrNull() ?: 6.0
-                        line.startsWith("#EXT-X-ENDLIST") -> endList = true
-                        line.startsWith("#EXT-X-MAP:") ->
-                            mapUri = Regex("URI=\"([^\"]+)\"").find(line)?.groupValues?.get(1)
-                        line.isNotEmpty() && !line.startsWith("#") ->
-                            segments.add(resolve(playlistUrl, line))
-                    }
+            for (raw in text.lines()) {
+                val line = raw.trim()
+                when {
+                    line.startsWith("#EXT-X-TARGETDURATION:") ->
+                        targetSeconds = line.substringAfter(':').toDoubleOrNull() ?: 6.0
+                    line.startsWith("#EXT-X-ENDLIST") -> endList = true
+                    line.startsWith("#EXT-X-MAP:") ->
+                        mapUri = Regex("URI=\"([^\"]+)\"").find(line)?.groupValues?.get(1)
+                    line.isNotEmpty() && !line.startsWith("#") -> segments.add(resolve(playlistUrl, line))
                 }
+            }
 
+            try {
                 if (!initWritten && mapUri != null) {
-                    downloadTo(resolve(playlistUrl, mapUri), fos)
+                    written += downloadTo(resolve(playlistUrl, mapUri), out)
                     initWritten = true
                 }
                 for (segment in segments) {
                     if (!running) break
-                    if (seen.add(segment)) downloadTo(segment, fos)
+                    if (segment !in seen) {
+                        written += downloadTo(segment, out)
+                        seen.add(segment)
+                        if (seen.size > 600) seen.remove(seen.first()) // keeps memory small on long recordings
+                    }
                 }
-                if (endList) break
+                failures = 0
+            } catch (e: IOException) {
+                failures++
+                if (failures > 60) throw e
+            }
+            if (written >= nextCheck) {
+                nextCheck = written + CHECK_EVERY_BYTES
+                if (!spaceOk(written)) return
+            }
+            if (endList) break
 
-                val waitMs = (targetSeconds * 500).toLong().coerceIn(1_000L, 5_000L)
-                var waited = 0L
-                while (running && waited < waitMs) {
-                    Thread.sleep(250L)
-                    waited += 250L
+            sleepWhileRunning((targetSeconds * 500).toLong().coerceIn(1_000L, 5_000L))
+            if (running) {
+                try {
+                    text = httpText(playlistUrl)
+                } catch (e: IOException) {
+                    failures++
+                    if (failures > 60) throw e
                 }
-                if (running) text = httpText(playlistUrl)
             }
         }
     }
 
-    private fun downloadTo(address: String, out: OutputStream) {
+    private fun sleepWhileRunning(ms: Long) {
+        var waited = 0L
+        while (running && waited < ms) {
+            Thread.sleep(250L)
+            waited += 250L
+        }
+    }
+
+    private fun downloadTo(address: String, out: OutputStream): Long {
         val conn = open(address)
         connection = conn
+        var total = 0L
         try {
             conn.inputStream.use { input ->
                 val buffer = ByteArray(64 * 1024)
@@ -264,12 +364,14 @@ class StreamRecorder(private val context: Context) {
                     val n = input.read(buffer)
                     if (n < 0) break
                     out.write(buffer, 0, n)
+                    total += n
                 }
             }
         } finally {
             conn.disconnect()
             connection = null
         }
+        return total
     }
 
     private fun httpText(address: String): String {
@@ -282,69 +384,40 @@ class StreamRecorder(private val context: Context) {
     }
 
     /** Opens a connection and follows redirects (also http -> https). */
-    private fun open(address: String): HttpURLConnection {
-        var current = address
-        repeat(6) {
-            val conn = URL(current).openConnection() as HttpURLConnection
-            conn.connectTimeout = 15_000
-            conn.readTimeout = 20_000
-            conn.instanceFollowRedirects = false
-            conn.setRequestProperty("User-Agent", "OsoGoldTV/1.0")
-            val code = conn.responseCode
-            if (code in 300..399) {
-                val location = conn.getHeaderField("Location")
-                conn.disconnect()
-                if (location.isNullOrBlank()) throw IOException("redirect without location")
-                current = URL(URL(current), location).toString()
-            } else if (code in 200..299) {
-                return conn
-            } else {
-                conn.disconnect()
-                throw IOException("HTTP $code")
-            }
-        }
-        throw IOException("too many redirects")
-    }
+    private fun open(address: String): HttpURLConnection =
+        NetConfig.open(address, connectMs = 15_000, readMs = 20_000)
 
     private fun resolve(base: String, relative: String): String =
         if (relative.startsWith("http://", true) || relative.startsWith("https://", true)) relative
         else URL(URL(base), relative).toString()
 
-    // ------------------------------------------------------------------ saving
+    // ------------------------------------------------------------------ helpers
 
-    private fun saveToDownloads(source: File, fileName: String, mime: String): String? {
-        return try {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/OsoGoldTV")
-                    put(MediaStore.MediaColumns.IS_PENDING, 1)
-                }
-                val resolver = context.contentResolver
-                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
-                val stream = resolver.openOutputStream(uri) ?: return null
-                stream.use { out -> source.inputStream().use { it.copyTo(out) } }
-                values.clear()
-                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
-            } else {
-                val dir = File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "OsoGoldTV"
-                )
-                dir.mkdirs()
-                val target = File(dir, fileName)
-                source.copyTo(target, overwrite = true)
-                MediaScannerConnection.scanFile(
-                    context, arrayOf(target.absolutePath), arrayOf(mime), null
-                )
-            }
-            "Download/OsoGoldTV/$fileName"
-        } catch (e: Exception) {
-            Log.e(TAG, "Saving to Downloads failed", e)
-            null
+    /** (file extension, isLive) of an address. */
+    private fun kindOf(url: String): Pair<String, Boolean> {
+        val path = url.substringBefore('?').lowercase(Locale.ROOT)
+        val ext = path.substringAfterLast('.', "")
+        return when {
+            path.contains(".m3u8") -> "ts" to true
+            ext in setOf("mp4", "mkv", "avi", "mov", "webm", "m4v", "flv") -> ext to false
+            path.contains("/movie/") || path.contains("/series/") -> (ext.ifEmpty { "mp4" }) to false
+            ext == "mp3" -> "mp3" to true
+            ext in setOf("aac", "m4a") -> "aac" to true
+            ext == "ts" -> "ts" to true
+            else -> "ts" to true
         }
+    }
+
+    private fun mimeOf(ext: String): String = when (ext) {
+        "mp4", "m4v" -> "video/mp4"
+        "mkv" -> "video/x-matroska"
+        "avi" -> "video/x-msvideo"
+        "mov" -> "video/quicktime"
+        "webm" -> "video/webm"
+        "flv" -> "video/x-flv"
+        "mp3" -> "audio/mpeg"
+        "aac" -> "audio/aac"
+        else -> "video/mp2t"
     }
 
     private fun sanitize(name: String): String =
@@ -352,5 +425,8 @@ class StreamRecorder(private val context: Context) {
 
     companion object {
         private const val TAG = "StreamRecorder"
+        private const val CHECK_EVERY_BYTES = 32L * 1024L * 1024L
+        private const val MIN_FREE_BYTES = 150L * 1024L * 1024L
+        private const val CONVERT_LIMIT_BYTES = 500L * 1024L * 1024L
     }
 }

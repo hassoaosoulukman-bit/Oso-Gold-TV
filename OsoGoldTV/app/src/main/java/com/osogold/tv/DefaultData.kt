@@ -16,6 +16,14 @@ object DefaultData {
 
     val sourceKeys = listOf(SRC_LIVE, SRC_MOVIES, SRC_SERIES, SRC_RADIO, SRC_QURAN)
 
+    /**
+     * Pinned default Xtream Codes server.
+     * Put your server address here (for example "http://my-server.com:8080") and the app will
+     * ask only for user name and password. Leave it empty to let the user type the server
+     * (the settings screen can also pin the typed server at run time).
+     */
+    const val XTREAM_DEFAULT_SERVER = ""
+
     fun sourceTitle(key: String): String = when (key) {
         SRC_LIVE -> "البث المباشر"
         SRC_MOVIES -> "الأفلام"

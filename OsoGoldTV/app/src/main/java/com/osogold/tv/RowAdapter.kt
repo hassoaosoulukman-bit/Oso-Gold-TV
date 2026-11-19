@@ -8,6 +8,8 @@ import android.widget.ImageView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
+import coil.dispose
+import coil.load
 
 /** Adapter of the list panel (channels, countries, favourites). */
 class RowAdapter(
@@ -17,6 +19,13 @@ class RowAdapter(
 ) : RecyclerView.Adapter<RowAdapter.Holder>() {
 
     private var rows: List<Row> = emptyList()
+
+    /** Tag of the selected row of a sections list (highlighted). */
+    var selectedTag: String? = null
+        set(value) {
+            field = value
+            notifyDataSetChanged()
+        }
 
     /** URL of the entry that is playing right now (highlighted). */
     var playingUrl: String? = null
@@ -38,6 +47,7 @@ class RowAdapter(
     class Holder(view: View) : RecyclerView.ViewHolder(view) {
         val root: View = view.findViewById(R.id.rowRoot)
         val badge: TextView = view.findViewById(R.id.tvBadge)
+        val logo: ImageView = view.findViewById(R.id.ivLogo)
         val title: TextView = view.findViewById(R.id.tvTitle)
         val subtitle: TextView = view.findViewById(R.id.tvSubtitle)
         val star: ImageView = view.findViewById(R.id.ivStar)
@@ -55,6 +65,8 @@ class RowAdapter(
         val context = holder.itemView.context
 
         if (row.isHeader) {
+            holder.logo.dispose()
+            holder.logo.visibility = View.GONE
             holder.badge.visibility = View.GONE
             holder.star.visibility = View.GONE
             holder.subtitle.visibility = View.GONE
@@ -67,8 +79,27 @@ class RowAdapter(
             return
         }
 
-        holder.badge.visibility = View.VISIBLE
-        holder.badge.text = row.leading
+        val rowChannel = row.channel
+        if (rowChannel != null) {
+            // channels show their logo (a TV icon while the logo is missing / loading)
+            holder.badge.visibility = View.GONE
+            holder.logo.visibility = View.VISIBLE
+            if (rowChannel.logo.isBlank()) {
+                holder.logo.dispose()
+                holder.logo.setImageResource(R.drawable.ic_live)
+            } else {
+                holder.logo.load(rowChannel.logo) {
+                    crossfade(true)
+                    placeholder(R.drawable.ic_live)
+                    error(R.drawable.ic_live)
+                }
+            }
+        } else {
+            holder.logo.dispose()
+            holder.logo.visibility = View.GONE
+            holder.badge.visibility = View.VISIBLE
+            holder.badge.text = row.leading
+        }
         holder.title.text = row.title
         holder.title.setTextColor(ContextCompat.getColor(context, R.color.text_main))
         holder.title.setTypeface(null, Typeface.NORMAL)
@@ -81,7 +112,8 @@ class RowAdapter(
         }
 
         val channel = row.channel
-        val playing = channel != null && channel.url == playingUrl
+        val playing = (channel != null && channel.url == playingUrl) ||
+            (row.tag.isNotEmpty() && row.tag == selectedTag)
         holder.root.setBackgroundResource(if (playing) R.drawable.bg_row_active else R.drawable.bg_row)
         holder.root.setOnClickListener { onClick(row) }
 

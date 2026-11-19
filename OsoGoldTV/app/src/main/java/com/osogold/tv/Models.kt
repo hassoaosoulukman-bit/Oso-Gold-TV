@@ -7,7 +7,18 @@ data class Channel(
     val name: String,
     val url: String,
     val logo: String = "",
-    val group: String = ""
+    val group: String = "",
+    /** Not empty for an Xtream "series" entry: clicking it opens its episodes. */
+    val seriesId: String = "",
+    /** Xtream movie id (stream_id): used to load the story and the trailer of a movie. */
+    val infoId: String = ""
+)
+
+/** A playlist added by the user (link or file copied into the app). [value] = URL or "file:<path>". */
+data class CustomList(
+    val id: String,
+    val name: String,
+    val value: String
 )
 
 /** A country shown in the "Countries" section. */
@@ -45,7 +56,9 @@ data class Row(
     val leading: String = "",
     val channel: Channel? = null,
     val country: Country? = null,
-    val isHeader: Boolean = false
+    val isHeader: Boolean = false,
+    /** Navigation marker: "sec:<id>", "pkg:<id>" or "back". */
+    val tag: String = ""
 )
 
 /** The sections shown on the rotating orbit. */
@@ -61,5 +74,6 @@ enum class Section(
     SERIES("series", R.string.sec_series, R.drawable.ic_tv, DefaultData.SRC_SERIES),
     QURAN("quran", R.string.sec_quran, R.drawable.ic_quran, DefaultData.SRC_QURAN),
     RADIO("radio", R.string.sec_radio, R.drawable.ic_radio, DefaultData.SRC_RADIO),
+    SUBS("subs", R.string.sec_subs, R.drawable.ic_server, null),
     SETTINGS("settings", R.string.sec_settings, R.drawable.ic_settings, null)
 }

@@ -7,6 +7,8 @@ import android.os.Handler
 import android.os.Looper
 import android.view.View
 import android.widget.TextView
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -16,10 +18,15 @@ import androidx.media3.ui.PlayerView
 /**
  * Full screen welcome video (any format supported by Media3) with a "Skip" button.
  *
+ * Sound: ONLY the sound that is built into the video itself is played, at normal volume and
+ * without interruption. The app never plays any separate music or song. Before the video
+ * starts, anything that is still playing in the background (a stream left over from the last
+ * session) is stopped, and the video player takes the audio focus so nothing else can mix in.
+ *
  * Video source, in this order:
  *   1. the video chosen / recorded in Settings
  *   2. a file  res/raw/welcome.*  if you put one into the project
- *   3. otherwise an animated royal intro that also lasts 30 seconds
+ *   3. otherwise a silent animated royal intro that lasts 30 seconds
  */
 class WelcomeVideoActivity : BaseActivity() {
 
@@ -33,6 +40,10 @@ class WelcomeVideoActivity : BaseActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_welcome)
+
+        // No other sound may play while the welcome video runs.
+        PlaybackService.instance?.stopPlayback()
+        stopService(Intent(this, PlaybackService::class.java))
 
         playerView = findViewById(R.id.welcomePlayer)
         fallbackRoot = findViewById(R.id.fallbackRoot)
@@ -53,7 +64,16 @@ class WelcomeVideoActivity : BaseActivity() {
     }
 
     private fun startVideo(uri: Uri) {
-        val exo = ExoPlayer.Builder(this).build()
+        val attributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+        val exo = ExoPlayer.Builder(this)
+            // true = the video owns the audio focus, so no other sound can interrupt or mix in
+            .setAudioAttributes(attributes, true)
+            .build()
+        exo.volume = 1f // the original sound of the video, at its natural level
+        exo.repeatMode = Player.REPEAT_MODE_OFF
         player = exo
         playerView.player = exo
         exo.setMediaItem(MediaItem.fromUri(uri))
@@ -85,6 +105,7 @@ class WelcomeVideoActivity : BaseActivity() {
         if (finished) return
         finished = true
         handler.removeCallbacks(finishRunnable)
+        player?.stop()
         startActivity(Intent(this, MainActivity::class.java))
         finish()
     }
