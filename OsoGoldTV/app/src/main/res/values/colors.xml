@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="gold">#FFD4AF37</color>
+    <color name="gold_light">#FFFFD86B</color>
+    <color name="gold_deep">#FF9A7B1E</color>
+    <color name="panel">#FF0C0A05</color>
+    <color name="text_main">#FFF3E9CF</color>
+    <color name="record_red">#FFE5192B</color>
+</resources>

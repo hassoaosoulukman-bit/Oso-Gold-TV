@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">Oso Gold TV</string>
+
+    <!-- Sections (orbit) -->
+    <string name="sec_live">البث المباشر</string>
+    <string name="sec_countries">الدول</string>
+    <string name="sec_movies">الأفلام</string>
+    <string name="sec_series">المسلسلات</string>
+    <string name="sec_quran">القرآن الكريم</string>
+    <string name="sec_radio">الراديو</string>
+    <string name="sec_settings">الإعدادات</string>
+
+    <!-- Main screen -->
+    <string name="search_hint">بحث سريع…</string>
+    <string name="favorites">المفضلة</string>
+    <string name="sleep_timer">مؤقت النوم</string>
+    <string name="refresh">تحديث</string>
+    <string name="back">رجوع</string>
+    <string name="loading">جارٍ التحميل…</string>
+    <string name="now_playing_none">لا يوجد بث قيد التشغيل</string>
+    <string name="rec_label">● REC</string>
+
+    <!-- Password -->
+    <string name="password_title">أدخل كلمة السر</string>
+    <string name="password_hint">كلمة السر</string>
+    <string name="password_enter">دخول</string>
+    <string name="password_wrong">كلمة السر غير صحيحة</string>
+
+    <!-- Welcome video -->
+    <string name="skip">تخطي</string>
+
+    <!-- Settings -->
+    <string name="settings_title">الإعدادات</string>
+    <string name="settings_password">كلمة السر</string>
+    <string name="settings_welcome_video">الفيديو الترحيبي</string>
+    <string name="settings_sources">مصادر القوائم</string>
+</resources>

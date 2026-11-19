@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <declare-styleable name="GoldIconButton">
+        <attr name="gbIcon" format="reference" />
+        <attr name="gbLabel" format="string" />
+    </declare-styleable>
+
+    <declare-styleable name="RoyalLogoView">
+        <attr name="rlShowText" format="boolean" />
+    </declare-styleable>
+</resources>
