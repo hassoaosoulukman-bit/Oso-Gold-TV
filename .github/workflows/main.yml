@@ -11,13 +11,30 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Inspect and Fix
+      - name: Unzip and Auto-Fix Errors
         run: |
           mkdir -p extracted
           unzip -o OsoGoldTV/OsoGoldTV_Pro.zip -d extracted/
-          echo "=== PlaylistRepository.kt ==="
-          sed -n '115,130p' extracted/OsoGoldTV/app/src/main/java/com/osogold/tv/PlaylistRepository.kt
-          echo "=== RecordingStore.kt ==="
-          sed -n '125,140p' extracted/OsoGoldTV/app/src/main/java/com/osogold/tv/RecordingStore.kt
-          echo "=== VlcEngine.kt ==="
-          sed -n '88,105p' extracted/OsoGoldTV/app/src/main/java/com/osogold/tv/VlcEngine.kt
+          sed -i 's/lastUpdateMillis = System.currentTimeMillis()//g' extracted/OsoGoldTV/app/src/main/java/com/osogold/tv/PlaylistRepository.kt
+          sed -i 's/return out/out/g' extracted/OsoGoldTV/app/src/main/java/com/osogold/tv/RecordingStore.kt
+          sed -i 's/player?.addSlave(Media.Slave.Type.Subtitle, uri, true)/player?.addSlave(org.videolan.libvlc.interfaces.IMedia.Slave.Type.Subtitle, uri, true)/g' extracted/OsoGoldTV/app/src/main/java/com/osogold/tv/VlcEngine.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK
+        run: |
+          cd extracted/OsoGoldTV
+          gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oso-Gold-TV-New-APK
+          path: "**/build/outputs/apk/debug/*.apk"
